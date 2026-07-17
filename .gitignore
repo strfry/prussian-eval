@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Environment
+.env
+*.env
+env.*.sh
+
+# eval run artifacts
+logs/
+evals/results/
+*.eval
