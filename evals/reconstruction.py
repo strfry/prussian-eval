@@ -27,8 +27,8 @@ Run::
     inspect view      # browse pass/fail transcripts
 
 The ``pos="ADV"`` default is the adverb example (embedding-recovery probe);
-``pos`` / ``min_words`` / ``max_words`` / ``lang`` / ``instruct`` are knobs on
-the same pipeline.
+``pos`` / ``min_words`` / ``max_words`` / ``instruct`` are knobs on the same
+pipeline.
 """
 
 from __future__ import annotations
@@ -394,7 +394,6 @@ def reconstruction(
     pos: str | None = "ADV",
     min_words: int = 1,
     max_words: int | None = None,
-    lang: str = "en",
     limit: int | None = None,
     shuffle: bool = False,
     seed: int = 0,
@@ -406,7 +405,6 @@ def reconstruction(
             pos=pos,
             min_words=min_words,
             max_words=max_words,
-            lang=lang,
             limit=limit,
             shuffle=shuffle,
             seed=seed,
