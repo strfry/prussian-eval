@@ -73,11 +73,11 @@ _PROMPTS = Path(__file__).resolve().parent.parent.parent / "mcp" / "prompts"
 _CONTRACT = (
     "Translate the sentence below into reconstructed Prussian (Prūsiskan).\n"
     "First call consult_linguist() to analyse the sentence structure and "
-    "identify which words you need to look up (skip any word already listed "
-    "in the base vocabulary or in the WORDS FOUND SO FAR section). Then "
-    "find each remaining word with search_dictionary, fetch the exact "
-    "inflected form with get_word_forms, and check your draft with "
-    "validate_prussian.\n"
+    "identify which words you need to look up. Do NOT call search_dictionary "
+    "for any word listed in the BASE VOCABULARY or in the WORDS FOUND SO FAR "
+    "section — those forms are already exact. Then find each remaining word "
+    "with search_dictionary, fetch the exact inflected form with "
+    "get_word_forms, and check your draft with validate_prussian.\n"
     "When you are done, briefly explain your translation choices (which "
     "case / ending you picked and why), then call submit() with ONLY the "
     "Prussian sentence."
@@ -408,13 +408,22 @@ _SUBMIT_DESCRIPTION = (
 )
 
 
+def _tool_name(t):
+    ri = getattr(t, "__registry_info__", None)
+    if ri is not None:
+        return ri.name
+    return getattr(t, "__name__", repr(t))
+
+
 @tool
 def consult_linguist():
     async def execute(question: str, analysis: str) -> str:
-        """Consult a Prussian linguistics expert. Call this FIRST in every
-        round to analyse the sentence structure, identify which words need
-        lookup vs. which are in the base vocabulary, and plan your
-        translation approach.
+        """Consult a Prussian linguistics expert. Call this to analyse the
+        sentence structure, identify which words need lookup vs. which are
+        in the base vocabulary, and plan your translation approach. After
+        your initial analysis, proceed directly with search_dictionary and
+        get_word_forms — do not call consult_linguist again unless you are
+        stuck.
 
         Args:
           question: The linguistic question or sentence you are working on.
@@ -459,8 +468,17 @@ def _extract_findings(messages, last_assistant_msg):
     id_to_fn = {tc.id: tc.function for tc in tcs}
 
     for tm in tool_msgs:
-        fn = id_to_fn.get(getattr(tm, "tool_call_id", None), getattr(tm, "function", ""))
-        content = tm.content if isinstance(tm.content, str) else str(tm.content or "")
+        fn = tm.function or id_to_fn.get(getattr(tm, "tool_call_id", None), "")
+        raw = tm.content
+        if isinstance(raw, str):
+            content = raw
+        elif isinstance(raw, list):
+            content = " ".join(
+                c.text if hasattr(c, "text") else str(c)
+                for c in raw
+            )
+        else:
+            content = str(raw or "")
         try:
             data = json.loads(content)
         except (json.JSONDecodeError, TypeError):
@@ -468,7 +486,8 @@ def _extract_findings(messages, last_assistant_msg):
 
         if fn == "search_dictionary":
             if isinstance(data, list):
-                for entry in data:
+                # only take the top result per query (search returns 10)
+                for entry in data[:1]:
                     word = entry.get("word", "")
                     trs = entry.get("translations", {})
                     engl = ", ".join(trs.get("engl", [])) or ", ".join(
@@ -617,10 +636,15 @@ def compacting_agent(tools, init=None, message_limit=80, max_rounds=12, prefix="
         }
 
         for _round in range(max_rounds):
+            # drop consult_linguist after round 2 to force progression
+            round_tools = all_tools if _round < 2 else [
+                t for t in all_tools
+                if _tool_name(t) != "consult_linguist"
+            ]
             # generate with current (single) user message
             state.output = await model.generate(
                 input=state.messages,
-                tools=all_tools,
+                tools=round_tools,
             )
 
             if state.output.stop_reason == "model_length":
