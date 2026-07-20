@@ -1958,10 +1958,13 @@ requires-dist = [
     { name = "model2vec", extras = ["distill"], marker = "extra == 'distill'" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
+    { name = "sentence-transformers", marker = "extra == 'sentence-transformers'", specifier = ">=3" },
     { name = "torch", marker = "extra == 'distill'", specifier = ">=2.9.0", index = "https://download.pytorch.org/whl/xpu" },
+    { name = "torch", marker = "extra == 'sentence-transformers'", specifier = ">=2.9.0", index = "https://download.pytorch.org/whl/xpu" },
     { name = "triton-xpu", marker = "extra == 'distill'", index = "https://download.pytorch.org/whl/xpu" },
+    { name = "triton-xpu", marker = "extra == 'sentence-transformers'", index = "https://download.pytorch.org/whl/xpu" },
 ]
-provides-extras = ["local", "model2vec", "distill", "dev"]
+provides-extras = ["local", "model2vec", "distill", "sentence-transformers", "dev"]
 
 [package.metadata.requires-dev]
 dev = [
