@@ -50,7 +50,7 @@ from inspect_ai.scorer import (
     metric,
     scorer,
 )
-from inspect_ai.solver import Generate, TaskState, basic_agent, solver
+from inspect_ai.solver import Generate, TaskState, solver
 
 from prussian.adapters.agent.runner import extract_candidate
 from prussian.tools import validate_tool
@@ -72,11 +72,15 @@ _PROMPTS = Path(__file__).resolve().parent.parent.parent / "mcp" / "prompts"
 # the eval's control (no system prompt).
 _CONTRACT = (
     "Translate the sentence below into reconstructed Prussian (Prūsiskan).\n"
-    "Do not answer from memory — every Prussian word must come from the "
-    "tools: find each word with search_dictionary, fetch the exact "
+    "First call consult_linguist() to analyse the sentence structure and "
+    "identify which words you need to look up (skip any word already listed "
+    "in the base vocabulary or in the WORDS FOUND SO FAR section). Then "
+    "find each remaining word with search_dictionary, fetch the exact "
     "inflected form with get_word_forms, and check your draft with "
     "validate_prussian.\n"
-    "Then call submit() with ONLY the Prussian sentence."
+    "When you are done, briefly explain your translation choices (which "
+    "case / ending you picked and why), then call submit() with ONLY the "
+    "Prussian sentence."
 )
 
 
@@ -389,7 +393,279 @@ def gold_match():
     return score
 
 
-# ── task ──────────────────────────────────────────────────────────────────────
+# ── compacting agent ──────────────────────────────────────────────────────────
+
+from inspect_ai.model import execute_tools, get_model
+from inspect_ai.tool._tool import tool
+from inspect_ai.tool._tool_with import tool_with
+
+
+_SUBMIT_NAME = "submit"
+_SUBMIT_DESCRIPTION = (
+    "Submit the final Prussian translation. Pass ONLY the "
+    "Prussian sentence as the answer — no commentary, no "
+    "quotes, no label."
+)
+
+
+@tool
+def consult_linguist():
+    async def execute(question: str, analysis: str) -> str:
+        """Consult a Prussian linguistics expert. Call this FIRST in every
+        round to analyse the sentence structure, identify which words need
+        lookup vs. which are in the base vocabulary, and plan your
+        translation approach.
+
+        Args:
+          question: The linguistic question or sentence you are working on.
+          analysis: Your analysis of the sentence: structure, which words
+            to look up, which are in the base vocab, and your translation
+            plan.
+        """
+        return f"Analysis recorded. Proceed with your plan: {analysis[:120]}"
+
+    return execute
+
+
+def _extract_findings(messages, last_assistant_msg):
+    """Parse tool-call arguments + tool-result JSON from the last round.
+
+    Returns a dict with keys: analyses, words, forms, lookup, validation.
+    """
+    findings: dict = {
+        "analyses": [],
+        "words": [],
+        "forms": [],
+        "lookup": [],
+        "validation": None,
+    }
+
+    # collect tool-call arguments from the last assistant message
+    tcs = getattr(last_assistant_msg, "tool_calls", None) or []
+    call_args: dict[str, list[dict]] = {}
+    for tc in tcs:
+        call_args.setdefault(tc.function, []).append(tc.arguments or {})
+
+    # consult_linguist → analysis text
+    for args in call_args.get("consult_linguist", []):
+        a = args.get("analysis") or ""
+        q = args.get("question") or ""
+        if a:
+            findings["analyses"].append(a if not q else f"Q: {q}\n{a}")
+
+    # tool results (role=tool messages after the last assistant message)
+    tool_msgs = [m for m in messages if m.role == "tool"]
+    # map tool_call_id → function name from the assistant message
+    id_to_fn = {tc.id: tc.function for tc in tcs}
+
+    for tm in tool_msgs:
+        fn = id_to_fn.get(getattr(tm, "tool_call_id", None), getattr(tm, "function", ""))
+        content = tm.content if isinstance(tm.content, str) else str(tm.content or "")
+        try:
+            data = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        if fn == "search_dictionary":
+            if isinstance(data, list):
+                for entry in data:
+                    word = entry.get("word", "")
+                    trs = entry.get("translations", {})
+                    engl = ", ".join(trs.get("engl", [])) or ", ".join(
+                        v for vs in trs.values() for v in (vs if isinstance(vs, list) else [vs])
+                    )
+                    if word:
+                        findings["words"].append(f"{word} ({engl})" if engl else word)
+
+        elif fn == "get_word_forms":
+            if isinstance(data, list):
+                for entry in data:
+                    lemma = entry.get("lemma", "")
+                    forms = entry.get("forms", [])
+                    form_strs = [
+                        f"{f.get('form','')} [{', '.join(f.get('tags',[]))}]"
+                        for f in forms
+                        if f.get("form")
+                    ]
+                    if lemma:
+                        desc = entry.get("desc", "")
+                        findings["forms"].append(
+                            f"{lemma}" + (f" ({desc})" if desc else "")
+                            + (f": {'; '.join(form_strs)}" if form_strs else " — no forms matched")
+                        )
+
+        elif fn == "lookup_prussian_word":
+            if isinstance(data, list):
+                for tok in data:
+                    surface = tok.get("token", tok.get("word", ""))
+                    lemma = tok.get("lemma", "")
+                    tags = ", ".join(tok.get("tags", []))
+                    if surface:
+                        findings["lookup"].append(
+                            f"{surface}" + (f" → {lemma}" if lemma else "")
+                            + (f" [{tags}]" if tags else "")
+                        )
+
+        elif fn == "validate_prussian":
+            overall = data.get("overall", {}) if isinstance(data, dict) else {}
+            status = overall.get("status", "")
+            n_viol = overall.get("n_violations", "?")
+            sentences = data.get("sentences", []) if isinstance(data, dict) else []
+            violations = []
+            for s in sentences:
+                for v in s.get("violations", []):
+                    violations.append(
+                        f"{v.get('check','')}: {v.get('message','')}"
+                    )
+            val = f"status={status}, violations={n_viol}"
+            if violations:
+                val += "\n  " + "\n  ".join(violations)
+            findings["validation"] = val
+
+    return findings
+
+
+def _build_compacted_message(header: str, findings: dict, prefix: str, input_text: str) -> str:
+    """Build a fresh user message: original header + findings block + translate line."""
+    parts = [header]
+
+    # accumulate findings sections
+    sections: list[str] = []
+    if findings["analyses"]:
+        sections.append(
+            "PREVIOUS ANALYSIS (from consult_linguist):\n"
+            + "\n---\n".join(findings["analyses"])
+        )
+    if findings["words"]:
+        sections.append(
+            "WORDS FOUND SO FAR (do NOT search for these again):\n"
+            + "\n".join(f"- {w}" for w in findings["words"])
+        )
+    if findings["forms"]:
+        sections.append(
+            "FORMS RETRIEVED:\n"
+            + "\n".join(f"- {f}" for f in findings["forms"])
+        )
+    if findings["lookup"]:
+        sections.append(
+            "WORDS CHECKED (lookup_prussian_word):\n"
+            + "\n".join(f"- {l}" for l in findings["lookup"])
+        )
+    if findings["validation"]:
+        sections.append(
+            "LAST VALIDATION:\n"
+            + findings["validation"]
+        )
+
+    if sections:
+        parts.append("\n\n".join(sections))
+
+    parts.append(prefix + input_text)
+    return "\n\n".join(parts)
+
+
+@solver
+def compacting_agent(tools, init=None, message_limit=80, max_rounds=12, prefix="Translate: "):
+    """Agent that compacts the chat history after every tool round.
+
+    After each round of tool calls, the entire message history is replaced
+    with a single user message that contains the original instruction
+    header plus an accumulated 'findings' block (words found, forms
+    retrieved, validation status, prior analyses).  This keeps token cost
+    linear (not quadratic) and prevents Cohere command-r from re-firing
+    the same searches on a growing history.
+    """
+
+    @tool
+    def submit():
+        async def execute(answer: str) -> str:
+            """Submit an answer for evaluation.
+
+            Args:
+              answer (str): Submitted answer
+            """
+            return answer
+
+        return execute
+
+    all_tools = [*tools, tool_with(submit(), _SUBMIT_NAME, _SUBMIT_DESCRIPTION)]
+
+    async def solve(state: TaskState, generate: Generate) -> TaskState:
+        state.message_limit = message_limit or state.message_limit or 50
+
+        # apply init (build initial user prompt)
+        if init:
+            state = await init(state, generate)
+
+        # capture original header (everything before the "Translate: " line)
+        original_content = state.messages[0].content if state.messages else ""
+        header = original_content
+        # strip the trailing "Translate: <text>" to get the header
+        # (init puts it at the end)
+        prefix_marker = original_content.rfind(prefix)
+        if prefix_marker >= 0:
+            header = original_content[:prefix_marker].rstrip()
+
+        input_text = state.input_text
+        model = get_model()
+        findings: dict = {
+            "analyses": [],
+            "words": [],
+            "forms": [],
+            "lookup": [],
+            "validation": None,
+        }
+
+        for _round in range(max_rounds):
+            # generate with current (single) user message
+            state.output = await model.generate(
+                input=state.messages,
+                tools=all_tools,
+            )
+
+            if state.output.stop_reason == "model_length":
+                break
+
+            msg = state.output.message
+            tcs = getattr(msg, "tool_calls", None) or []
+
+            if not tcs:
+                # model produced text, no tool calls → treat as final answer
+                state.messages.append(msg)
+                break
+
+            # check for submit() before executing tools
+            submitted = any(tc.function == _SUBMIT_NAME for tc in tcs)
+            # execute tools
+            result = await execute_tools([msg], all_tools)
+            if result.output:
+                state.output = result.output
+
+            if submitted:
+                # keep the submit call + result in the transcript
+                state.messages.append(msg)
+                state.messages.extend(result.messages)
+                break
+
+            # extract findings from this round
+            round_findings = _extract_findings(result.messages, msg)
+            for k in ("analyses", "words", "forms", "lookup"):
+                # dedup while preserving order
+                seen = set(findings[k])
+                for item in round_findings[k]:
+                    if item not in seen:
+                        findings[k].append(item)
+                        seen.add(item)
+            if round_findings["validation"]:
+                findings["validation"] = round_findings["validation"]
+
+            # compact: replace entire history with a fresh user message
+            compacted = _build_compacted_message(header, findings, prefix, input_text)
+            state.messages = [ChatMessageUser(content=compacted)]
+
+        return state
+
+    return solve
 
 
 @task
@@ -401,33 +677,17 @@ def reconstruction(
 ) -> Task:
     return Task(
         dataset=make_dataset(pos=pos),
-        solver=basic_agent(
-            # init replaces basic_agent's default system message — the
-            # surface stays exactly build_prompt's user message.
-            init=build_prompt(instruct=instruct, prefix=prefix),
+        solver=compacting_agent(
             tools=[
+                consult_linguist(),
                 search_dictionary(),
                 lookup_prussian_word(),
                 get_word_forms(),
                 validate_prussian(),
             ],
-            max_attempts=1,
-            # Each tool round costs 2 messages; thorough models need ~20
-            # rounds on a 4-7-word sentence (gpt-oss-120b hit 40).  Models
-            # that never submit() burn the full budget — cap via
-            # -T message_limit=40 for such runs (input cost is quadratic
-            # in rounds, no prompt caching on OpenAI-compatible proxies).
+            init=build_prompt(instruct=instruct, prefix=prefix),
             message_limit=message_limit,
-            submit_description=(
-                "Submit the final Prussian translation. Pass ONLY the "
-                "Prussian sentence as the answer — no commentary, no "
-                "quotes, no label."
-            ),
-            continue_message=(
-                "You have not submitted an answer yet. When you have the "
-                "final Prussian translation, call submit() with the "
-                "sentence as the answer."
-            ),
+            prefix=prefix,
         ),
         scorer=gold_match(),
         metadata={"instruct": instruct, "pos": pos},
