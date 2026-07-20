@@ -12,6 +12,9 @@ gold subtitle.  The input surface is a knob (``instruct``):
   reference, nothing else (no contract).
 * ``basevocab`` — contract + ``prompts/base_vocab.md`` + syntax rules
   (function words in context instead of burning search steps on them).
+* ``toolguide`` — basevocab + tool-workflow guide (``_TOOL_GUIDE``:
+  procedure, ``features`` parameter, FST tag legend — for models that
+  don't infer the procedure from the tool descriptions alone).
 * ``vocab``    — contract + base vocab + adverb rules + syntax rules.
 
 The final answer is collected via a ``submit()`` tool (``basic_agent``): the
@@ -80,6 +83,54 @@ _CONTRACT = (
 )
 
 
+# Tool workflow + FST tag legend — added after transcript analysis of
+# command-r-08-2024 runs: without explicit workflow text the model never
+# used filter_tags, rarely passed features, barely validated and never
+# submitted.  Tool descriptions alone don't anchor the procedure for
+# every model.  submit()/validate sequencing stays in _CONTRACT (it is
+# part of the output contract, not of the tool API).
+_TOOL_GUIDE = (
+    "TOOL WORKFLOW (follow this for EVERY content word):\n"
+    "\n"
+    "a) Find the lemma: search_dictionary (source-language concept →\n"
+    "   Prussian entries).  To analyze Prussian words you already have,\n"
+    "   pass them to lookup_prussian_word instead (it can FST-analyze a\n"
+    "   whole draft sentence at once).\n"
+    "b) Determine the word's syntactic role (subject / object / attribute /\n"
+    "   prepositional object …).\n"
+    "c) Derive its case from role and government (preposition/verb); take\n"
+    "   gender and number from the head noun.\n"
+    "d) Fetch the EXACT inflected form with get_word_forms and its\n"
+    "   `features` parameter, e.g. features=\"Akk+Sg+Masc\",\n"
+    "   features=\"Nom+Pl+Fem\", features=\"Gen+Pl\", features=\"Ind+Pres+P3\".\n"
+    "   Never use a bare lemma in the sentence and never pick a form\n"
+    "   freehand — always request it via `features`.\n"
+    "\n"
+    "Never repeat a tool call with identical arguments — the result will\n"
+    "be identical.  If a result lacks what you need, change the arguments\n"
+    "or move on.\n"
+    "If get_word_forms returns no matching form, that combination does\n"
+    "not exist: choose the closest tags from `available_features`.\n"
+    "Lemmas with empty `forms` are indeclinable — use them unchanged.\n"
+    "\n"
+    "FST TAG LEGEND (the values for `features` and `filter_tags`):\n"
+    "\n"
+    "- POS: N (noun), Adj (adjective), V (verb), Part (participle),\n"
+    "  Pron (pronoun), Adv (adverb), Prp (preposition), Num (numeral)\n"
+    "- Mood: Ind (indicative), Opt (optative), Imp (imperative),\n"
+    "  Subj (subjunctive)\n"
+    "- Tense: Pres (present), Pret (preterite), Inf (infinitive)\n"
+    "- Case: Nom, Gen, Dat, Akk\n"
+    "- Number: Sg, Pl — Gender: Masc, Fem, Neut — Person: P1, P2, P3\n"
+    "- Other: Pass (passive), Refl (reflexive), Cmp (comparative),\n"
+    "  Sup (superlative)\n"
+    "\n"
+    "Combine tags with \"+\": features=\"Akk+Sg+Fem\", filter_tags=\"Part+Pass\".\n"
+    "3rd-person verb forms carry no Sg/Pl distinction — request them with\n"
+    "P3 alone (\"Ind+Pres+P3\", never \"…+P3+Sg\")."
+)
+
+
 # Adverb formation — the corpus is adverb-focused (pos="ADV") and failure
 # analysis showed models paraphrasing adverbs away (e.g. "en prūsisku"
 # instead of prūsiskai).  Mirrors the ADVERBS block of the agent prompt.
@@ -120,6 +171,16 @@ def _instruction(instruct: str) -> str:
         vocab = (_PROMPTS / "base_vocab.md").read_text(encoding="utf-8").strip()
         return (
             _CONTRACT
+            + "\n\n" + vocab
+            + "\n\nSyntax rules to respect:\n\n" + rules
+        )
+    if instruct == "toolguide":
+        # basevocab plus the tool-usage guide (see _TOOL_GUIDE).
+        rules = (_PROMPTS / "syntax_rules.txt").read_text(encoding="utf-8").strip()
+        vocab = (_PROMPTS / "base_vocab.md").read_text(encoding="utf-8").strip()
+        return (
+            _CONTRACT
+            + "\n\n" + _TOOL_GUIDE
             + "\n\n" + vocab
             + "\n\nSyntax rules to respect:\n\n" + rules
         )
