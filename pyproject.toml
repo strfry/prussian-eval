@@ -7,7 +7,10 @@ requires-python = "==3.12.*"
 dependencies = [
     "prussian-mcp",
     "inspect-ai>=0.3.247",
+    "openai>=1.50",
     "ragas>=0.2",
+    "runpod>=1.10.0",
+    "flash>=1.0.3",
 ]
 
 [build-system]
