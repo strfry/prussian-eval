@@ -41,6 +41,8 @@ from pathlib import Path
 
 from inspect_ai import Task, task
 from inspect_ai.model import ChatMessageUser
+
+import evals.providers.cohere  # noqa: F401 — registers the "cohere" model API
 from inspect_ai.scorer import (
     SampleScore,
     Score,
