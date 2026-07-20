@@ -1,36 +1,24 @@
 """Dataset loader for the corpus-reconstruction eval (pure, no LLM).
 
-Builds inspect-ai ``Sample``s from English↔Old-Prussian sentence pairs:
+Builds inspect-ai ``Sample``s from the curated ``data/quasi_gold.jsonl``
+(606 sentences): English gloss as input, Old-Prussian sentence as gold target,
+with *focus tokens* (words of the filtered POS) for the recovery probe.
 
-* the **English** gloss (the most-frequent translation across all subtitle
-  tracks in the YouTube corpus) is the agent input,
-* the Old-Prussian subtitle (``text_clean`` / normalized ``text_norm``) is the
-  gold target,
-* the gold **CoNLL-U parse** (``prussian_silver.conllu``) supplies the part-of-
-  speech filter and the *focus tokens* (words of the filtered POS) that the
-  recovery probe looks for.
-
-The join between the two corpora is the exact sentence text
-(silver ``# text`` == corpus ``text_clean``).
-
-``make_dataset`` is a single configurable filter: ``pos`` (default ``"ADV"`` —
-the adverb example) is just one knob alongside ``min_words`` / ``max_words``.
+The ``pos`` parameter (default ``"ADV"``) controls which POS tokens are
+flagged as focus — sentences without focus tokens for the chosen POS are
+skipped when ``pos`` is not ``None``.
 """
 
 from __future__ import annotations
 
 import json
 import re
-import random
 from pathlib import Path
 
 from inspect_ai.dataset import MemoryDataset, Sample
 
-# Sibling checkouts: mcp/, corpus/, fst/ live next to each other under the
-# prussian binder repo root (see pyproject [tool.uv.sources]).
-_PROJECTS = Path(__file__).resolve().parent.parent.parent
-DEFAULT_CORPUS = _PROJECTS / "corpus" / "parsed" / "youtube_corpus_sentences.json"
-DEFAULT_SILVER = _PROJECTS / "fst" / "data" / "prussian_silver.conllu"
+_EVAL_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_QUASI_GOLD = _EVAL_DIR / "data" / "quasi_gold.jsonl"
 
 # ---------------------------------------------------------------------------
 # CoNLL-U parser
@@ -170,60 +158,42 @@ def load_translations(path: Path) -> dict[str, dict]:
 
 def make_dataset(
     pos: str | None = "ADV",
-    min_words: int = 1,
-    max_words: int | None = None,
-    limit: int | None = None,
-    shuffle: bool = False,
-    seed: int = 0,
-    corpus_path: str | Path = DEFAULT_CORPUS,
-    silver_path: str | Path = DEFAULT_SILVER,
+    path: str | Path = DEFAULT_QUASI_GOLD,
 ) -> MemoryDataset:
-    """Build the reconstruction dataset.
+    """Build the reconstruction dataset from the curated quasi-gold JSONL.
 
     Args:
-        pos: keep only sentences whose gold parse contains a token with this
+        pos: keep only sentences whose token list contains a word with this
             UPOS (e.g. ``"ADV"``, ``"VERB"``).  ``None`` disables the POS
             filter (and the focus-recovery probe).
-        min_words / max_words: word-count bounds on the gold sentence
-            (``max_words=None`` = no upper bound).
-        limit: keep at most this many samples (after optional shuffle).
-        shuffle / seed: deterministic shuffle before applying ``limit``.
-        corpus_path / silver_path: override the sibling-repo defaults.
+        path: path to ``quasi_gold.jsonl``.
 
     Returns:
         A ``MemoryDataset`` of ``Sample(input=<gloss>, target=<text_norm>,
-        metadata={gold, pos, focus, n_words})``.
+        metadata={gold, pos, focus, n_words, sent_id})``.
     """
-    sents = parse_silver(Path(silver_path))
-    trans_by_text = load_translations(Path(corpus_path))
-
     samples: list[Sample] = []
-    for text, sinfo in sents.items():
-        tokens = sinfo["tokens"]
-        focus = [{"form": t["form"], "lemma": t["lemma"]} for t in tokens if t["upos"] == pos]
-        if pos is not None and not focus:
-            continue
-        tr = trans_by_text.get(text)
-        if not tr:
-            continue
-        n_words = len(text.split())
-        if n_words < min_words or (max_words is not None and n_words > max_words):
-            continue
-        samples.append(
-            Sample(
-                input=tr["translation_en"],
-                target=tr["text_norm"] or text,
-                metadata={
-                    "gold": text,
-                    "pos": pos,
-                    "focus": focus,
-                    "n_words": n_words,
-                },
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            tokens = row.get("tokens", [])
+            focus = [{"form": t["form"], "lemma": t["lemma"]} for t in tokens if t["upos"] == pos]
+            if pos is not None and not focus:
+                continue
+            samples.append(
+                Sample(
+                    input=row["translation_en"],
+                    target=row.get("text_norm") or row["text_clean"],
+                    metadata={
+                        "gold": row["text_clean"],
+                        "pos": pos,
+                        "focus": focus,
+                        "n_words": row.get("n_words", len(row["text_clean"].split())),
+                        "sent_id": row.get("sent_id", ""),
+                    },
+                )
             )
-        )
-
-    if shuffle:
-        random.Random(seed).shuffle(samples)
-    if limit is not None:
-        samples = samples[:limit]
     return MemoryDataset(samples)

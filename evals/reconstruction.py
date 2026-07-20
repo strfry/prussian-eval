@@ -20,15 +20,16 @@ candidate is a structured tool argument rather than regex-scraped prose.  The
 scorer falls back to transcript extraction for models that never submit and
 records which path was used (``candidate_source`` / ``submit_rate``).
 
+Dataset: ``data/quasi_gold.jsonl`` (606 curated sentences).
+
 Run::
 
-    inspect eval evals/reconstruction.py --model openai/$OPENAI_MODEL -T limit=3
+    inspect eval evals/reconstruction.py --limit 3
     inspect eval evals/reconstruction.py -T instruct=syntax -T pos=VERB
     inspect view      # browse pass/fail transcripts
 
 The ``pos="ADV"`` default is the adverb example (embedding-recovery probe);
-``pos`` / ``min_words`` / ``max_words`` / ``instruct`` are knobs on the same
-pipeline.
+``pos`` / ``instruct`` are knobs on the same pipeline.
 """
 
 from __future__ import annotations
@@ -392,23 +393,12 @@ def gold_match():
 @task
 def reconstruction(
     pos: str | None = "ADV",
-    min_words: int = 1,
-    max_words: int | None = None,
-    limit: int | None = None,
-    shuffle: bool = False,
-    seed: int = 0,
     instruct: str = "minimal",
     prefix: str = "Translate: ",
+    message_limit: int = 80,
 ) -> Task:
     return Task(
-        dataset=make_dataset(
-            pos=pos,
-            min_words=min_words,
-            max_words=max_words,
-            limit=limit,
-            shuffle=shuffle,
-            seed=seed,
-        ),
+        dataset=make_dataset(pos=pos),
         solver=basic_agent(
             # init replaces basic_agent's default system message — the
             # surface stays exactly build_prompt's user message.
@@ -421,8 +411,11 @@ def reconstruction(
             ],
             max_attempts=1,
             # Each tool round costs 2 messages; thorough models need ~20
-            # rounds on a 4-7-word sentence (gpt-oss-120b hit 40).
-            message_limit=80,
+            # rounds on a 4-7-word sentence (gpt-oss-120b hit 40).  Models
+            # that never submit() burn the full budget — cap via
+            # -T message_limit=40 for such runs (input cost is quadratic
+            # in rounds, no prompt caching on OpenAI-compatible proxies).
+            message_limit=message_limit,
             submit_description=(
                 "Submit the final Prussian translation. Pass ONLY the "
                 "Prussian sentence as the answer — no commentary, no "
